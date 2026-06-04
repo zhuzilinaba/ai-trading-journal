@@ -16,8 +16,40 @@ from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference
 
 # ── Config ──────────────────────────────────────────────────────────────────
-DATA_FILE   = Path.home() / ".trade_journal_data.json"
-API_KEY_FILE = Path.home() / ".trade_journal_api_key.txt"
+APP_DIR = Path(__file__).resolve().parent
+ENV_FILE = APP_DIR / ".env"
+
+def load_project_env(env_file=ENV_FILE):
+    """Load simple KEY=value pairs from .env without adding a dependency."""
+    if not env_file.exists():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+try:
+    load_project_env()
+except OSError:
+    pass
+
+DATA_FILE = Path(os.environ.get(
+    "TRADE_JOURNAL_DATA_FILE",
+    str(Path.home() / ".trade_journal_data.json")
+)).expanduser()
+API_KEY_FILE = Path(os.environ.get(
+    "TRADE_JOURNAL_API_KEY_FILE",
+    str(Path.home() / ".trade_journal_api_key.txt")
+)).expanduser()
 
 COLORS = {
     "bg":       "#0e0e14",
@@ -38,19 +70,72 @@ RESULTS     = ["盈利", "亏损", "保本"]
 EMOTIONS    = ["冷静", "贪婪", "恐惧", "犹豫", "冲动", "FOMO"]
 GRADE_OPTS  = ["A — 完美执行", "B — 基本合理", "C — 有瑕疵", "D — 错误判断", "F — 严重失误"]
 
+NUMERIC_FIELD_LABELS = {
+    "quantity": "数量",
+    "price": "成交价",
+    "amount": "金额",
+    "stop_loss": "止损价",
+    "take_profit": "止盈价",
+    "commission": "手续费",
+    "pnl": "盈亏",
+}
+
 # ── Data Layer ───────────────────────────────────────────────────────────────
 
 def load_data():
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except Exception:
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("trades", [])
+                data.setdefault("settings", {})
+                return data
+        except (OSError, json.JSONDecodeError):
             pass
     return {"trades": [], "settings": {}}
 
 def save_data(data):
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                          encoding="utf-8")
+
+def parse_number(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return 0.0
+    return float(text)
+
+def validate_trade(trade):
+    errors = []
+    if not trade.get("symbol", "").strip():
+        errors.append("请填写交易品种。")
+
+    date_text = trade.get("date", "").strip()
+    if not date_text:
+        errors.append("请填写交易日期。")
+    else:
+        try:
+            datetime.date.fromisoformat(date_text)
+        except ValueError:
+            errors.append("日期格式请使用 YYYY-MM-DD。")
+
+    time_text = trade.get("time", "").strip()
+    if time_text:
+        try:
+            datetime.datetime.strptime(time_text, "%H:%M")
+        except ValueError:
+            errors.append("时间格式请使用 HH:MM。")
+
+    for key, label in NUMERIC_FIELD_LABELS.items():
+        if str(trade.get(key, "")).strip():
+            try:
+                parse_number(trade.get(key))
+            except ValueError:
+                errors.append(f"{label}必须是数字。")
+
+    return errors
 
 def new_trade():
     return {
@@ -79,17 +164,38 @@ def new_trade():
 
 # ── Claude API Image Recognition ─────────────────────────────────────────────
 
+def _anthropic_error_message(raw_body: str) -> str:
+    try:
+        payload = json.loads(raw_body)
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return error["message"]
+        if payload.get("message"):
+            return payload["message"]
+    except json.JSONDecodeError:
+        pass
+    return raw_body[:500] if raw_body else "No response body returned."
+
 def ocr_trade_image(image_path: str, api_key: str) -> dict:
     """Send image to Claude API, extract trade details."""
     import urllib.request, urllib.error
     
-    path = Path(image_path)
+    if not api_key or not api_key.strip():
+        raise ValueError("Missing Claude/Anthropic API key.")
+
+    path = Path(image_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Image file not found: {path}")
+
     suffix = path.suffix.lower()
     mime = {".jpg":"image/jpeg",".jpeg":"image/jpeg",
             ".png":"image/png",".gif":"image/gif",".webp":"image/webp"
             }.get(suffix, "image/jpeg")
     
-    b64 = base64.b64encode(path.read_bytes()).decode()
+    try:
+        b64 = base64.b64encode(path.read_bytes()).decode()
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read image file: {exc}") from exc
     
     prompt = """请仔细分析这张交易截图/交割单，提取以下信息，严格用JSON格式返回，不要加任何说明文字：
 {
@@ -129,13 +235,39 @@ def ocr_trade_image(image_path: str, api_key: str) -> dict:
         },
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        detail = _anthropic_error_message(raw)
+        raise RuntimeError(f"Claude API request failed with HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Unable to reach Claude API: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("Claude API request timed out. Please try again.") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude API returned a response that was not valid JSON.") from exc
     
-    text = body["content"][0]["text"].strip()
+    content = body.get("content", [])
+    text = ""
+    for block in content:
+        if isinstance(block, dict) and block.get("text"):
+            text = block["text"]
+            break
+    if not text:
+        raise RuntimeError("Claude API response did not include recognizable text.")
+
+    text = text.strip()
     text = re.sub(r"^```[a-z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text)
-    return json.loads(text)
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude response was not valid JSON. Please try again or enter the trade manually.") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Claude response did not contain a trade detail object.")
+    return result
 
 # ── Excel Export ──────────────────────────────────────────────────────────────
 
@@ -207,15 +339,15 @@ def export_to_excel(trades: list, filepath: str):
         dir_cell.font = Font(color="4fc3f7" if is_buy else "ef5350", bold=True)
 
         for ci2, key in zip([5,6,7,8,9,10], ["quantity","price","amount","stop_loss","take_profit","commission"]):
-            try:    c(ci2, float(t.get(key,"") or 0), "#,##0.00")
-            except: c(ci2, t.get(key,""))
+            try:    c(ci2, parse_number(t.get(key,"")), "#,##0.00")
+            except ValueError: c(ci2, t.get(key,""))
 
         pnl_raw = t.get("pnl","")
         try:
-            pnl_val = float(pnl_raw or 0)
+            pnl_val = parse_number(pnl_raw)
             pnl_cell = c(11, pnl_val, '+#,##0.00;-#,##0.00;"-"')
             pnl_cell.font = profit_font if pnl_val > 0 else (loss_font if pnl_val < 0 else Font())
-        except:
+        except ValueError:
             c(11, pnl_raw)
 
         result = t.get("result","")
@@ -337,8 +469,8 @@ def export_to_excel(trades: list, filepath: str):
     for t in trades:
         d = t.get("date","")
         if not d: continue
-        try: daily[d]["pnl"] += float(t.get("pnl","") or 0)
-        except: pass
+        try: daily[d]["pnl"] += parse_number(t.get("pnl",""))
+        except ValueError: pass
         daily[d]["count"] += 1
 
     cum = 0.0
@@ -658,17 +790,32 @@ class TradeJournalApp:
             t[key] = widget.get("1.0","end").strip()
         t["image_path"] = self.img_path_var.get() if self.img_path_var.get() != "未选择图片" else ""
 
-        if not t.get("symbol"):
-            messagebox.showwarning("提示", "请填写交易品种")
+        errors = validate_trade(t)
+        if errors:
+            self.nb.select(0)
+            messagebox.showwarning("请检查输入", "\n".join(errors))
             return
 
+        updated_trades = list(self.trades)
         if self.edit_idx is None:
-            self.trades.append(t)
+            updated_trades.append(dict(t))
+            next_edit_idx = len(updated_trades) - 1
         else:
-            self.trades[self.edit_idx] = t
+            updated_trades[self.edit_idx] = dict(t)
+            next_edit_idx = self.edit_idx
 
-        self.data["trades"] = self.trades
-        save_data(self.data)
+        previous_trades = self.data.get("trades", [])
+        self.data["trades"] = updated_trades
+        try:
+            save_data(self.data)
+        except Exception as e:
+            self.data["trades"] = previous_trades
+            messagebox.showerror("保存失败", f"无法保存交易记录：\n{e}")
+            return
+
+        self.trades = self.data["trades"]
+        self.edit_idx = next_edit_idx
+        self.current = self.trades[self.edit_idx]
         self._refresh_list()
         messagebox.showinfo("✓", f"已保存：{t['symbol']} {t['date']}")
 
@@ -680,8 +827,15 @@ class TradeJournalApp:
         idx = self._list_indices[sel[0]]
         t   = self.trades[idx]
         if messagebox.askyesno("确认删除", f"删除 {t.get('symbol','')} {t.get('date','')}？"):
-            self.trades.pop(idx)
-            save_data(self.data)
+            removed = self.trades.pop(idx)
+            self.data["trades"] = self.trades
+            try:
+                save_data(self.data)
+            except Exception as e:
+                self.trades.insert(idx, removed)
+                self.data["trades"] = self.trades
+                messagebox.showerror("删除失败", f"无法保存删除操作：\n{e}")
+                return
             self._refresh_list()
             self._new_trade()
 
@@ -732,7 +886,11 @@ class TradeJournalApp:
             self.ocr_preview.insert("1.0", pretty)
             self.ocr_status.config(text="✓ 识别成功！请检查并补充信息后保存", fg=COLORS["green"])
         except Exception as e:
-            self.ocr_status.config(text=f"✗ 识别失败：{e}", fg=COLORS["red"])
+            msg = str(e) or "未知错误"
+            self.ocr_status.config(text="✗ 识别失败，请检查 API Key、网络连接或图片格式", fg=COLORS["red"])
+            self.ocr_preview.delete("1.0","end")
+            self.ocr_preview.insert("1.0", f"AI 识别失败：\n{msg}")
+            messagebox.showerror("AI识别失败", f"无法识别这张图片。\n\n原因：{msg}\n\n请检查 API Key、网络连接和图片格式，或手动填写交易信息。")
 
     def _export_excel(self):
         if not self.trades:
@@ -759,8 +917,14 @@ class TradeJournalApp:
             messagebox.showerror("导出失败", str(e))
 
     def _get_api_key(self):
-        if API_KEY_FILE.exists():
-            return API_KEY_FILE.read_text(encoding="utf-8").strip()
+        env_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+        if env_key:
+            return env_key.strip()
+        try:
+            if API_KEY_FILE.exists():
+                return API_KEY_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
         return self.data.get("settings", {}).get("api_key", "")
 
     def _settings_dialog(self):
@@ -785,9 +949,17 @@ class TradeJournalApp:
 
         def save_key():
             key = var.get().strip()
-            API_KEY_FILE.write_text(key, encoding="utf-8")
-            self.data.setdefault("settings",{})["api_key"] = key
-            save_data(self.data)
+            try:
+                API_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                if key:
+                    API_KEY_FILE.write_text(key, encoding="utf-8")
+                elif API_KEY_FILE.exists():
+                    API_KEY_FILE.unlink()
+                self.data.setdefault("settings",{}).pop("api_key", None)
+                save_data(self.data)
+            except Exception as e:
+                messagebox.showerror("保存失败", f"无法保存 API Key：\n{e}")
+                return
             messagebox.showinfo("✓","API Key 已保存")
             dlg.destroy()
 

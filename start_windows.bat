@@ -1,22 +1,29 @@
 @echo off
 chcp 65001 >nul
-echo 正在启动交易复盘日志系统...
+cd /d "%~dp0"
+
+echo Starting AI Trading Journal...
 echo.
 
-:: 检查 Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 Python，请先安装 Python 3.8+
-    echo 下载地址: https://www.python.org/downloads/
+    echo [Error] Python was not found. Please install Python 3.10 or newer.
+    echo Download: https://www.python.org/downloads/
     pause
-    exit /b
+    exit /b 1
 )
 
-:: 安装依赖
-echo 检查依赖包...
-pip install openpyxl pandas pillow -q
+if not exist ".venv" (
+    echo Creating virtual environment...
+    python -m venv .venv
+)
 
-:: 启动程序
+call .venv\Scripts\activate.bat
+
+echo Installing dependencies...
+python -m pip install --upgrade pip -q
+python -m pip install -r requirements.txt -q
+
 python trade_journal.py
 
 pause
