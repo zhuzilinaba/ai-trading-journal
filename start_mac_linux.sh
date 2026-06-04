@@ -1,6 +1,22 @@
-#!/bin/bash
-echo "检查依赖..."
-pip3 install openpyxl pandas pillow -q 2>/dev/null || pip install openpyxl pandas pillow -q
+#!/usr/bin/env bash
+set -e
 
-echo "启动交易复盘日志..."
-python3 "$(dirname "$0")/trade_journal.py"
+cd "$(dirname "$0")"
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [ -x "/opt/homebrew/bin/python3" ]; then
+  PYTHON_BIN="/opt/homebrew/bin/python3"
+fi
+
+if [ ! -d ".venv" ]; then
+  echo "Creating virtual environment..."
+  "$PYTHON_BIN" -m venv .venv
+fi
+
+echo "Installing dependencies..."
+. .venv/bin/activate
+python -m pip install --upgrade pip -q
+python -m pip install -r requirements.txt -q
+
+echo "Starting AI Trading Journal..."
+python trade_journal.py
