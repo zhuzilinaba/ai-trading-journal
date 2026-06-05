@@ -2,8 +2,6 @@
 
 AI-assisted trading journal that extracts trade details from screenshots and exports a professional Excel review workbook.
 
-Recommended repository name: `ai-trading-journal`
-
 ## Overview
 
 AI Trading Journal is a local desktop application for traders who want a structured workflow for trade logging, screenshot-assisted data entry, post-trade review, and Excel-based analysis. The app is designed as a portfolio project across IT support, finance technology, AI automation, data analysis, and trading review systems.
@@ -36,16 +34,12 @@ The application runs locally with Python and Tkinter. Trade records are stored o
 
 ## Screenshots
 
-Add sanitized screenshots before publishing the repository.
-
-Suggested screenshots:
+Sanitized screenshots will be added in `docs/screenshots/`, covering:
 
 - Main trading journal dashboard
 - Manual trade entry form
 - AI screenshot recognition tab
 - Exported Excel workbook summary sheet
-
-Screenshot placeholders live in `docs/screenshots/`.
 
 Important: Do not publish screenshots that show real account numbers, order IDs, balances, broker names, positions, API keys, or personally identifiable financial information.
 
@@ -77,7 +71,7 @@ ai-trading-journal/
 ### Clone
 
 ```bash
-git clone https://github.com/<your-username>/ai-trading-journal.git
+git clone https://github.com/simon-liu-dev/ai-trading-journal.git
 cd ai-trading-journal
 ```
 
